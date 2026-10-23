@@ -1,0 +1,2430 @@
+---
+title: "Soybean Rhizosphere Metagenome Analyses"
+author: "Qi Wang (qwang2@mpipz.mpg.de)"
+affiliation: "Lab of Paul Schulze-Lefert, Ruben Garrido-Oter, Stephane Hacquard | Department of Plant and microbe Interaction | Max Planck Institute for Plant Breeding Research"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  rmdformats::html_clean:
+  code_folding: hide
+toc: true
+thumbnails: false
+toc_depth: 3
+pkgdown:
+  as_is: true
+---
+  
+We have 36 samples that represent the following: 
+
+.WT_0uM_1	0uM	WT	Rep.1
+.WT_0uM_2	0uM	WT	Rep.2
+.WT_0uM_3	0uM	WT	Rep.3
+.WT_100uM_1	100uM	WT	Rep.1
+.WT_100uM_2	100uM	WT	Rep.2
+.WT_100uM_3	100uM	WT	Rep.3
+.WT_10uM_1	10uM	WT	Rep.1
+.WT_10uM_2	10uM	WT	Rep.2
+.WT_10uM_3	10uM	WT	Rep.3
+.WT_200uM_1	200uM	WT	Rep.1
+.WT_200uM_2	200uM	WT	Rep.2
+.WT_200uM_3	200uM	WT	Rep.3
+.WT_20uM_1	20uM	WT	Rep.1
+.WT_20uM_2	20uM	WT	Rep.2
+.WT_20uM_3	20uM	WT	Rep.3
+.WT_50uM_1	50uM	WT	Rep.1
+.WT_50uM_2	50uM	WT	Rep.2
+.WT_50uM_3	50uM	WT	Rep.3
+.phr1_2_0uM_1	0uM	phr1phr2	Rep.1
+.phr1_2_0uM_2	0uM	phr1phr2	Rep.2
+.phr1_2_0uM_3	0uM	phr1phr2	Rep.3
+.phr1_2_100uM_1	100uM	phr1phr2	Rep.1
+.phr1_2_100uM_2	100uM	phr1phr2	Rep.2
+.phr1_2_100uM_3	100uM	phr1phr2	Rep.3
+.phr1_2_10uM_1	10uM	phr1phr2	Rep.1
+.phr1_2_10uM_2	10uM	phr1phr2	Rep.2
+.phr1_2_10uM_3	10uM	phr1phr2	Rep.3
+.phr1_2_200uM_1	200uM	phr1phr2	Rep.1
+.phr1_2_200uM_2	200uM	phr1phr2	Rep.2
+.phr1_2_200uM_3	200uM	phr1phr2	Rep.3
+.phr1_2_20uM_1	20uM	phr1phr2	Rep.1
+.phr1_2_20uM_2	20uM	phr1phr2	Rep.2
+.phr1_2_20uM_3	20uM	phr1phr2	Rep.3
+.phr1_2_50uM_1	50uM	phr1phr2	Rep.1
+.phr1_2_50uM_2	50uM	phr1phr2	Rep.2
+.phr1_2_50uM_3	50uM	phr1phr2	Rep.3
+
+
+
+
+#Load R packages
+
+```{r}
+library(vegan)
+library(ggplot2)
+library(readr)
+library(dplyr)
+library(tibble)
+library(readxl)
+library(tidyverse)  # includes ggplot2, dplyr, tibble, tidyr, etc.
+library(tidyr)
+library(scales)     # for percent_format in plots
+
+```
+
+
+
+# used tools in bash
+
+```{r}
+# Standard shell utilities
+mkdir
+ls
+basename
+echo
+cat
+rm
+sleep
+sort
+tr
+sed
+awk
+find
+
+# Quality control
+fastp
+
+# Host removal & read mapping
+bowtie2
+samtools
+
+# Taxonomic classification & abundance estimation
+kraken2
+bracken
+python
+python3  # for Bracken matrix merging
+
+# Coverage normalization
+bbnorm.sh
+
+# Assembly & assembly QC
+megahit
+quast.py
+
+# Sequence retrieval from KEGG
+curl
+
+```
+
+# 1 This script performs automated quality control, merging, and host (soybean) read removal on metagenomic sequencing data to generate high-quality, host-free reads for downstream analysis.
+
+  
+```{bash, cache=F}
+#!/bin/bash
+#SBATCH --job-name=QC_HostRemoval
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=64G  # Reduced - Bowtie2 with 16GB index needs ~30GB max
+#SBATCH --time=12:00:00
+#SBATCH --output=01_QC_HostRemoval_%j.log
+#SBATCH --error=01_QC_HostRemoval_%j.err
+
+set -euo pipefail
+
+# ===================== CONFIG =====================
+THREADS=32  # Use all threads throughout
+
+DATA_DIR="/Data/to/path"
+OUT_DIR="/Data/to/path"
+NOHOST_DIR="${OUT_DIR}/nohost_reads"
+TEMP_DIR="${OUT_DIR}/tmp_$$"  # Unique temp directory
+
+# Bowtie2 index PREFIX (NOT directory)
+BT2_DB="/Data/to/path/Standard-16GB"
+
+# ===================== FUNCTIONS =====================
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+check_bowtie2_index() {
+    if [[ ! -f "${BT2_DB}.1.bt2" ]] && [[ ! -f "${BT2_DB}.1.bt2l" ]]; then
+        log "ERROR: Bowtie2 index not found at ${BT2_DB}"
+        exit 1
+    fi
+}
+
+# ===================== SETUP =====================
+mkdir -p "${OUT_DIR}" "${NOHOST_DIR}" "${TEMP_DIR}"
+trap 'rm -rf "${TEMP_DIR}"' EXIT  # Clean up temp directory on exit
+
+# Check for bowtie2 index
+check_bowtie2_index
+
+# Check if tools are available
+for tool in fastp bowtie2 samtools; do
+    if ! command -v "$tool" &> /dev/null; then
+        log "ERROR: $tool not found in PATH"
+        exit 1
+    done
+done
+
+# ===================== MAIN LOOP =====================
+for SAMPLE_DIR in "${DATA_DIR}"/*; do
+    [[ -d "${SAMPLE_DIR}" ]] || continue
+
+    SAMPLE=$(basename "${SAMPLE_DIR}")
+    log "=============================="
+    log "Processing sample: ${SAMPLE}"
+
+    # Check for paired-end reads
+    FILES_R1=("${SAMPLE_DIR}"/*_R1_*.fq.gz 2>/dev/null || true)
+    FILES_R2=("${SAMPLE_DIR}"/*_R2_*.fq.gz 2>/dev/null || true)
+    FILES_SINGLE=("${SAMPLE_DIR}"/*.fq.gz 2>/dev/null || true)
+    
+    IS_PAIRED=false
+    if [[ ${#FILES_R1[@]} -gt 0 ]] && [[ ${#FILES_R2[@]} -gt 0 ]]; then
+        IS_PAIRED=true
+        log "Detected paired-end reads"
+        R1_MERGED="${TEMP_DIR}/${SAMPLE}_R1_merged.fq.gz"
+        R2_MERGED="${TEMP_DIR}/${SAMPLE}_R2_merged.fq.gz"
+        
+        # Merge paired-end files
+        log "Merging R1 FASTQ files..."
+        cat "${FILES_R1[@]}" > "${R1_MERGED}"
+        log "Merging R2 FASTQ files..."
+        cat "${FILES_R2[@]}" > "${R2_MERGED}"
+        
+        # QC with fastp (paired-end)
+        log "Running fastp (paired-end)..."
+        fastp \
+            -i "${R1_MERGED}" \
+            -I "${R2_MERGED}" \
+            -o "${TEMP_DIR}/${SAMPLE}_R1_qc.fq.gz" \
+            -O "${TEMP_DIR}/${SAMPLE}_R2_qc.fq.gz" \
+            --thread ${THREADS} \
+            --html "${OUT_DIR}/${SAMPLE}_fastp.html" \
+            --json "${OUT_DIR}/${SAMPLE}_fastp.json" \
+            --detect_adapter_for_pe
+            
+        rm "${R1_MERGED}" "${R2_MERGED}"
+        
+        # Host removal (paired-end)
+        log "Removing host reads (paired-end)..."
+        bowtie2 \
+            -x "${BT2_DB}" \
+            -1 "${TEMP_DIR}/${SAMPLE}_R1_qc.fq.gz" \
+            -2 "${TEMP_DIR}/${SAMPLE}_R2_qc.fq.gz" \
+            -p ${THREADS} \
+            --un-conc-gz "${NOHOST_DIR}/${SAMPLE}_nohost_%.fq.gz" \
+            2> "${OUT_DIR}/${SAMPLE}_bowtie2.log" \
+            > /dev/null
+            
+        rm "${TEMP_DIR}/${SAMPLE}_R1_qc.fq.gz" "${TEMP_DIR}/${SAMPLE}_R2_qc.fq.gz"
+        
+    elif [[ ${#FILES_SINGLE[@]} -gt 0 ]]; then
+        log "Detected single-end reads"
+        MERGED_FASTQ="${TEMP_DIR}/${SAMPLE}_merged.fq.gz"
+        
+        # Merge single-end files
+        log "Merging FASTQ files..."
+        cat "${FILES_SINGLE[@]}" > "${MERGED_FASTQ}"
+        
+        # QC with fastp (single-end)
+        log "Running fastp (single-end)..."
+        fastp \
+            -i "${MERGED_FASTQ}" \
+            -o "${TEMP_DIR}/${SAMPLE}_qc.fq.gz" \
+            --thread ${THREADS} \
+            --html "${OUT_DIR}/${SAMPLE}_fastp.html" \
+            --json "${OUT_DIR}/${SAMPLE}_fastp.json"
+            
+        rm "${MERGED_FASTQ}"
+        
+        # Host removal (single-end) - using --un-gz for cleaner output
+        log "Removing host reads (single-end)..."
+        bowtie2 \
+            -x "${BT2_DB}" \
+            -U "${TEMP_DIR}/${SAMPLE}_qc.fq.gz" \
+            -p ${THREADS} \
+            --un-gz "${NOHOST_DIR}/${SAMPLE}_nohost.fq.gz" \
+            2> "${OUT_DIR}/${SAMPLE}_bowtie2.log" \
+            > /dev/null
+            
+        rm "${TEMP_DIR}/${SAMPLE}_qc.fq.gz"
+    else
+        log "WARNING: No FASTQ files found, skipping ${SAMPLE}"
+        continue
+    fi
+
+    log "Finished sample: ${SAMPLE}"
+done
+
+log "=========================================="
+log "QC + host removal completed for all samples"
+```
+
+
+
+# 2 This script performs taxonomic classification and abundance estimation of host-free metagenomic reads by running Kraken2 for read classification and Bracken for abundance re-estimation at multiple taxonomic levels, and then merges all results into sample-by-taxon abundance matrices for downstream microbial community analysis.
+
+
+  
+```{bash, cache=F}
+#!/bin/bash
+#========================================================
+# Kraken2 + Bracken pipeline (all taxonomic levels)
+# PAIRED-END VERSION
+# HPC-safe, handles multiple samples in parallel
+#========================================================
+set -euo pipefail
+
+############################
+# Logging function
+############################
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+############################
+# Activate Kraken2/Bracken environment
+############################
+source /opt/share/software/packages/miniconda3-4.12.0/etc/profile.d/conda.sh
+conda activate /Data/to/path/conda/envs/kraken2 || {
+    log "ERROR: Failed to activate conda environment"
+    exit 1
+}
+
+############################
+# Define paths
+############################
+READS_DIR="/Data/to/path"
+KRAKEN2_DB="/Data/to/path"
+OUTDIR="${READS_DIR}/kraken2_bracken"
+COMBINE_SCRIPT="/netscratch/dep_psl/grp_rgo/Qi/Tools/kraken2_db/Bracken/analysis_scripts/combine_bracken_outputs.py"
+
+# Create output directory
+mkdir -p "${OUTDIR}" || { log "ERROR: Cannot create ${OUTDIR}"; exit 1; }
+
+############################
+# HPC resource settings
+############################
+THREADS_PER_SAMPLE=20
+MAX_PARALLEL_SAMPLES=2   # 2 samples × 20 threads = 40 cores (safer for memory)
+READ_LEN=150
+
+############################
+# Taxonomic levels
+############################
+TAX_LEVELS=("S" "G" "F" "O" "C" "P")  # Species, Genus, Family, Order, Class, Phylum
+
+############################
+# Validate inputs
+############################
+log "Validating inputs..."
+
+# Check if input directory exists
+if [ ! -d "${READS_DIR}" ]; then
+    log "ERROR: Input directory ${READS_DIR} does not exist"
+    exit 1
+fi
+
+# Check if Kraken2 database exists
+if [ ! -f "${KRAKEN2_DB}/hash.k2d" ]; then
+    log "ERROR: Kraken2 database not found at ${KRAKEN2_DB}"
+    exit 1
+fi
+
+# Check if combine script exists
+if [ ! -f "${COMBINE_SCRIPT}" ]; then
+    log "ERROR: Combine script not found: ${COMBINE_SCRIPT}"
+    exit 1
+fi
+
+# Count paired-end samples (R1 files)
+SAMPLE_COUNT=$(find "${READS_DIR}" -maxdepth 1 -name "*_R1_nohost.fq.gz" | wc -l)
+if [ "${SAMPLE_COUNT}" -eq 0 ]; then
+    log "ERROR: No *_R1_nohost.fq.gz files found in ${READS_DIR}"
+    log "Expected paired-end files with naming: SAMPLE_R1_nohost.fq.gz and SAMPLE_R2_nohost.fq.gz"
+    exit 1
+fi
+log "Found ${SAMPLE_COUNT} paired-end samples to process"
+
+# Export variables for subshells
+export KRAKEN2_DB OUTDIR THREADS_PER_SAMPLE READ_LEN
+
+############################
+# Run Kraken2 + Bracken for all samples
+############################
+log "Starting Kraken2 + Bracken pipeline (paired-end)"
+
+# Find all R1 files and process
+find "${READS_DIR}" -maxdepth 1 -name "*_R1_nohost.fq.gz" | \
+while read -r R1_FILE; do
+    # Extract sample name (remove _R1_nohost.fq.gz)
+    SAMPLE=$(basename "${R1_FILE}" _R1_nohost.fq.gz)
+    
+    # Check if R2 file exists
+    R2_FILE="${READS_DIR}/${SAMPLE}_R2_nohost.fq.gz"
+    if [ ! -f "${R2_FILE}" ]; then
+        log "ERROR: R2 file not found for sample ${SAMPLE}: ${R2_FILE}"
+        continue
+    fi
+    
+    # Check if already processed (optional, comment out to force rerun)
+    if [ -f "${OUTDIR}/${SAMPLE}.kraken.report" ]; then
+        log "WARNING: ${SAMPLE} already has Kraken2 report, skipping"
+        log "  Remove ${OUTDIR}/${SAMPLE}.kraken.report to reprocess"
+        continue
+    fi
+    
+    echo "Processing sample: ${SAMPLE}"
+    echo "  R1: ${R1_FILE}"
+    echo "  R2: ${R2_FILE}"
+    
+    # Run Kraken2 (paired-end)
+    kraken2 \
+        --db "${KRAKEN2_DB}" \
+        --threads "${THREADS_PER_SAMPLE}" \
+        --confidence 0.1 \
+        --report "${OUTDIR}/${SAMPLE}.kraken.report" \
+        --output "${OUTDIR}/${SAMPLE}.kraken.out" \
+        --paired \
+        "${R1_FILE}" "${R2_FILE}" || {
+            log "ERROR: Kraken2 failed for ${SAMPLE}"
+            continue
+        }
+    
+    # Run Bracken for all taxonomic levels
+    for level in "${TAX_LEVELS[@]}"; do
+        log "  Running Bracken at level: ${level}"
+        bracken \
+            -d "${KRAKEN2_DB}" \
+            -i "${OUTDIR}/${SAMPLE}.kraken.report" \
+            -o "${OUTDIR}/${SAMPLE}.bracken_${level}.txt" \
+            -r "${READ_LEN}" \
+            -l "${level}" || {
+                log "ERROR: Bracken failed for ${SAMPLE} at level ${level}"
+                # Continue with other levels even if one fails
+            }
+    done
+    
+    log "Finished sample: ${SAMPLE}"
+    
+done | xargs -n 1 -P ${MAX_PARALLEL_SAMPLES} -I {} bash -c '{}'
+
+############################
+# Merge all Bracken outputs
+############################
+log "Merging Bracken outputs..."
+
+for level in "${TAX_LEVELS[@]}"; do
+    log "Merging Bracken outputs at level: ${level}"
+    
+    # Check if any bracken files exist
+    BRACKEN_FILES=(${OUTDIR}/*bracken_${level}.txt)
+    if [ ${#BRACKEN_FILES[@]} -eq 0 ]; then
+        log "WARNING: No bracken files found for level ${level}"
+        continue
+    fi
+    
+    # Run combine script
+    python "${COMBINE_SCRIPT}" \
+        -i ${OUTDIR}/*bracken_${level}.txt \
+        -o ${OUTDIR}/bracken_${level}_matrix.txt || {
+            log "ERROR: Failed to combine level ${level}"
+        }
+done
+
+############################
+# Final summary
+############################
+log "=========================================="
+log "Kraken2 + Bracken pipeline completed!"
+log "Results summary:"
+for level in "${TAX_LEVELS[@]}"; do
+    if [ -f "${OUTDIR}/bracken_${level}_matrix.txt" ]; then
+        LINES=$(wc -l < "${OUTDIR}/bracken_${level}_matrix.txt")
+        log "  ${level}: ${OUTDIR}/bracken_${level}_matrix.txt (${LINES} lines)"
+    else
+        log "  ${level}: MISSING"
+    fi
+done
+log "=========================================="
+```
+
+
+# 3 This script merges Bracken abundance outputs across all samples into taxon-by-sample matrices at multiple taxonomic levels, using relative abundances (fraction_total_reads) instead of raw read counts, to generate normalized community composition tables for downstream analysis.
+
+```{bash, cache=F, eval=F}
+#!/bin/bash
+#========================================================
+# Merge Bracken outputs using fraction_total_reads
+#========================================================
+
+# Folder with Bracken outputs
+BRACKEN_DIR="/Data/to/path"
+
+# Output folder (same as Bracken folder)
+MERGE_OUT=${BRACKEN_DIR}
+mkdir -p ${MERGE_OUT}
+
+# Taxonomic levels
+TAX_LEVELS=("S" "G" "F" "O" "C" "P")
+
+for level in "${TAX_LEVELS[@]}"; do
+    echo "Merging Bracken outputs at level: ${level}"
+    python3 - <<EOF
+import pandas as pd
+import glob
+import os
+
+# Find all Bracken files for this level
+files = glob.glob(os.path.join("${BRACKEN_DIR}", f"*bracken_${level}.txt"))
+dfs = []
+
+for f in files:
+    sample_name = os.path.basename(f).split(".bracken_")[0]
+    df = pd.read_csv(f, sep="\t", index_col=0)
+    # Use fraction_total_reads instead of new_est_reads
+    df = df[["fraction_total_reads"]]
+    df.rename(columns={"fraction_total_reads": sample_name}, inplace=True)
+    dfs.append(df)
+
+# Merge all samples into a single matrix
+if dfs:
+    merged = pd.concat(dfs, axis=1)
+    merged.fillna(0, inplace=True)
+    merged.to_csv(os.path.join("${MERGE_OUT}", f"bracken_${level}_matrix_fraction.txt"), sep="\t")
+EOF
+done
+
+echo "All merged Bracken matrices (fraction_total_reads) are in ${MERGE_OUT}"
+
+```
+
+
+
+#4 PCoA_plot_filtered
+
+```{r}
+
+############################
+# 1. Load libraries
+############################
+suppressPackageStartupMessages({
+  library(vegan)
+  library(ggplot2)
+  library(readr)
+  library(dplyr)
+  library(tibble)
+  library(readxl)
+})
+
+############################
+# 2. Input files
+############################
+bracken_file  <- "/Data/to/path"
+metadata_file <- "/Data/to/path"
+
+############################
+# 3. Load data
+############################
+abund <- read_tsv(bracken_file, show_col_types = FALSE)
+meta  <- read_excel(metadata_file, sheet = "Sheet1") %>%
+  select(SampleID, Genotype, Treatment)
+
+############################
+# 4. Prepare abundance matrix
+# Rows = taxa, Columns = samples
+############################
+abund_mat <- abund %>%
+  column_to_rownames(var = colnames(abund)[1]) %>%
+  as.matrix()
+abund_mat <- t(abund_mat)  # samples × taxa
+
+############################
+# 5. Filter low-abundance taxa
+# Keep taxa with mean relative abundance > 0.01%
+############################
+abund_mat <- abund_mat[, colMeans(abund_mat) > 0.0001]
+
+############################
+# 6. Hellinger transformation
+############################
+abund_hel <- decostand(abund_mat, method = "hellinger")
+
+############################
+# 7. Match metadata to abundance matrix
+############################
+meta <- meta %>%
+  filter(SampleID %in% rownames(abund_hel)) %>%
+  arrange(match(SampleID, rownames(abund_hel)))
+
+if (!all(meta$SampleID == rownames(abund_hel))) {
+  stop("Sample order mismatch between metadata and abundance matrix.")
+}
+
+############################
+# 8. Bray–Curtis distance
+############################
+bray_dist <- vegdist(abund_hel, method = "bray")
+
+############################
+# 9. PCoA
+############################
+pcoa_res <- cmdscale(bray_dist, eig = TRUE, k = 2)
+var_exp <- round(100 * pcoa_res$eig / sum(pcoa_res$eig), 1)
+
+pcoa_df <- data.frame(
+  SampleID = rownames(abund_hel),
+  PC1 = pcoa_res$points[, 1],
+  PC2 = pcoa_res$points[, 2]
+) %>%
+  left_join(meta, by = "SampleID")
+
+write.table(
+  pcoa_df,
+  file = "PCoA_coordinates_filtered_hellinger.tsv",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+############################
+# 10. Colors and shapes
+############################
+color_values <- c("#BE4BDB", "#228BE6")      # Genotype colors
+shape_values <- c(16, 17, 15, 3, 7, 8, 0)   # Treatment shapes
+
+# Ensure Genotype has exactly 2 levels
+pcoa_df$Genotype <- factor(pcoa_df$Genotype)
+
+# Custom Treatment order for legend
+treatment_order <- c(
+  "Brady_0uM",
+  "Brady_10uM",
+  "Brady_20uM",
+  "Brady_50uM",
+  "Brady_100uM",
+  "Brady_200uM"
+)
+pcoa_df$Treatment <- factor(pcoa_df$Treatment, levels = treatment_order)
+
+############################
+# 11. PCoA plot
+############################
+p <- ggplot(
+  pcoa_df,
+  aes(x = PC1, y = PC2, color = Genotype, shape = Treatment)
+) +
+  geom_point(size = 4, stroke = 0.8) +
+  scale_color_manual(values = color_values) +
+  scale_shape_manual(values = shape_values) +
+  labs(
+    x = paste0("PCoA1 (", var_exp[1], "%)"),
+    y = paste0("PCoA2 (", var_exp[2], "%)"),
+    color = "Genotype",
+    shape = "Treatment"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(size = 0.5),
+    text = element_text(size = 12),
+    legend.key.size = unit(0.4, "cm")
+  )
+
+print(p)
+
+ggsave(
+  "PCoA_plot_filtered_hellinger_custom_legend.pdf",
+  plot = p,
+  width = 7,
+  height = 6,
+  dpi = 300
+)
+
+############################
+# 12. PERMANOVA
+############################
+cat("\n=== PERMANOVA: Genotype ===\n")
+perm_genotype <- adonis2(bray_dist ~ Genotype, data = meta, permutations = 999)
+print(perm_genotype)
+
+cat("\n=== PERMANOVA: Treatment ===\n")
+perm_treatment <- adonis2(bray_dist ~ Treatment, data = meta, permutations = 999)
+print(perm_treatment)
+
+cat("\n=== PERMANOVA: Genotype × Treatment ===\n")
+perm_interaction <- adonis2(bray_dist ~ Genotype * Treatment, data = meta, permutations = 999)
+print(perm_interaction)
+
+############################
+# 13. Dispersion test (PERMDISP)
+############################
+cat("\n=== Homogeneity of dispersion (Genotype) ===\n")
+disp <- betadisper(bray_dist, meta$Genotype)
+print(anova(disp))
+
+############################
+# 14. Save PERMANOVA results
+############################
+sink("PERMANOVA_results_filtered_hellinger_custom_legend.txt")
+cat("PERMANOVA: Genotype\n")
+print(perm_genotype)
+cat("\nPERMANOVA: Treatment\n")
+print(perm_treatment)
+cat("\nPERMANOVA: Genotype × Treatment\n")
+print(perm_interaction)
+cat("\nDispersion test (Genotype)\n")
+print(anova(disp))
+sink()
+
+cat("\nAnalysis completed successfully.\n")
+
+
+
+
+```
+
+
+## 5 This R script produces a family-level relative abundance stacked bar plot from Bracken output.
+
+
+```{r}
+
+
+############################
+# Load required libraries
+############################
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(tibble)
+})
+
+############################
+# Input file
+############################
+bracken_file <- "/Data/to/path"
+
+############################
+# Read Bracken data
+# Rows = Family, Columns = Samples
+# Remove WT_10uM_2
+############################
+abund <- read_tsv(
+  bracken_file,
+  show_col_types = FALSE
+) %>%
+  select(-WT_10uM_2)
+
+############################
+# Set Family names as rownames
+############################
+abund_mat <- abund %>%
+  column_to_rownames(var = colnames(abund)[1]) %>%
+  as.matrix()
+
+############################
+# Convert to relative abundance
+############################
+abund_rel <- abund_mat / colSums(abund_mat)
+
+############################
+# Long format
+############################
+df_long <- as.data.frame(abund_rel) %>%
+  rownames_to_column("Family") %>%
+  pivot_longer(
+    cols = -Family,
+    names_to = "Sample",
+    values_to = "Abundance"
+  )
+
+############################
+# Collapse replicates by mean
+############################
+df_long <- df_long %>%
+  mutate(
+    Sample_group = str_remove(Sample, "_[1-3]$")
+  ) %>%
+  group_by(Sample_group, Family) %>%
+  summarise(Abundance = mean(Abundance), .groups = "drop")
+
+############################
+# Identify top 20 families (global mean)
+############################
+top20_families <- df_long %>%
+  group_by(Family) %>%
+  summarise(mean_abund = mean(Abundance), .groups = "drop") %>%
+  arrange(desc(mean_abund)) %>%
+  slice_head(n = 20) %>%
+  pull(Family)
+
+############################
+# Collapse rare families to "Others"
+############################
+df_long <- df_long %>%
+  mutate(
+    Family = ifelse(Family %in% top20_families, Family, "Others")
+  ) %>%
+  group_by(Sample_group, Family) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop")
+
+############################
+# Set factor levels (critical for colors)
+############################
+df_long$Family <- factor(
+  df_long$Family,
+  levels = c(top20_families, "Others")
+)
+
+############################
+# Define Sample order
+############################
+sample_order <- c(
+  "WT_0uM", "WT_10uM", "WT_20uM", "WT_50uM",
+  "WT_100uM", "WT_200uM",
+  "phr1_2_0uM", "phr1_2_10uM", "phr1_2_20uM",
+  "phr1_2_50uM", "phr1_2_100uM", "phr1_2_200uM"
+)
+
+df_long$Sample_group <- factor(
+  df_long$Sample_group,
+  levels = sample_order
+)
+
+############################
+# QIIME2-style color palette (20 families)
+############################
+qiime2_colors <- c(
+  "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+  "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+  "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
+  "#c49c94", "#f7b6d2", "#c7c7c7", "#dbdb8d", "#9edae5"
+)
+
+family_colors <- setNames(qiime2_colors, top20_families)
+family_colors <- c(family_colors, Others = "gray50")
+
+############################
+# Plot stacked bar chart
+############################
+p <- ggplot(df_long, aes(x = Sample_group, y = Abundance, fill = Family)) +
+  geom_bar(stat = "identity", width = 0.9) +
+  scale_fill_manual(values = family_colors) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = NULL,
+    y = "Relative abundance (%)",
+    fill = "Family"
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x  = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    axis.line    = element_line(size = 0.5),
+    text         = element_text(size = 10),
+    legend.key.size = unit(0.3, "cm")
+  )
+
+
+
+print(p)
+
+############################################################
+# End of script
+############################################################
+
+
+```
+
+
+## 6 This R script produces a genus-level relative abundance stacked bar plot from Bracken output, with several careful data preprocessing steps.
+
+
+
+```{r}
+############################
+# Load required libraries
+############################
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(tibble)
+})
+
+############################
+# Input file
+############################
+bracken_file <- "/Data/to/path"
+
+############################
+# Read Bracken data
+# Rows = Genus, Columns = Samples
+# Remove WT_10uM_2
+############################
+abund <- read_tsv(
+  bracken_file,
+  show_col_types = FALSE
+) %>%
+  select(-WT_10uM_2)
+
+############################
+# Set Genus names as rownames
+############################
+abund_mat <- abund %>%
+  column_to_rownames(var = colnames(abund)[1]) %>%
+  as.matrix()
+
+############################
+# Convert to relative abundance
+############################
+abund_rel <- abund_mat / colSums(abund_mat)
+
+############################
+# Long format
+############################
+df_long <- as.data.frame(abund_rel) %>%
+  rownames_to_column("Genus") %>%
+  pivot_longer(
+    cols = -Genus,
+    names_to = "Sample",
+    values_to = "Abundance"
+  )
+
+############################
+# Collapse replicates by mean
+############################
+df_long <- df_long %>%
+  mutate(
+    Sample_group = str_remove(Sample, "_[1-3]$")
+  ) %>%
+  group_by(Sample_group, Genus) %>%
+  summarise(Abundance = mean(Abundance), .groups = "drop")
+
+############################
+# Identify top 20 genera (global mean)
+############################
+top20_genera <- df_long %>%
+  group_by(Genus) %>%
+  summarise(mean_abund = mean(Abundance), .groups = "drop") %>%
+  arrange(desc(mean_abund)) %>%
+  slice_head(n = 20) %>%
+  pull(Genus)
+
+############################
+# Collapse rare genera to "Others"
+############################
+df_long <- df_long %>%
+  mutate(
+    Genus = ifelse(Genus %in% top20_genera, Genus, "Others")
+  ) %>%
+  group_by(Sample_group, Genus) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop")
+
+############################
+# Set factor levels (critical for colors)
+############################
+df_long$Genus <- factor(
+  df_long$Genus,
+  levels = c(top20_genera, "Others")
+)
+
+############################
+# Define Sample order
+############################
+sample_order <- c(
+  "WT_0uM", "WT_10uM", "WT_20uM", "WT_50uM",
+  "WT_100uM", "WT_200uM",
+  "phr1_2_0uM", "phr1_2_10uM", "phr1_2_20uM",
+  "phr1_2_50uM", "phr1_2_100uM", "phr1_2_200uM"
+)
+
+df_long$Sample_group <- factor(
+  df_long$Sample_group,
+  levels = sample_order
+)
+
+############################
+# QIIME2-style color palette (20 genera)
+############################
+qiime2_colors <- c(
+  "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+  "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+  "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
+  "#c49c94", "#f7b6d2", "#c7c7c7", "#dbdb8d", "#9edae5"
+)
+
+genus_colors <- setNames(qiime2_colors, top20_genera)
+genus_colors <- c(genus_colors, Others = "gray50")
+
+############################
+# Plot stacked bar chart
+############################
+p <- ggplot(df_long, aes(x = Sample_group, y = Abundance, fill = Genus)) +
+  geom_bar(stat = "identity", width = 0.9, alpha = 0.9) +
+  scale_fill_manual(values = genus_colors) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = NULL,
+    y = "Relative abundance (%)",
+    fill = "Genus"
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x  = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    axis.line    = element_line(size = 0.5),
+    text         = element_text(size = 10),
+    legend.key.size = unit(0.3, "cm")
+  )
+
+
+
+
+print(p)
+
+############################################################
+# End of script
+############################################################
+
+
+
+
+
+```
+
+
+
+#7. Shannon diversity
+```{r pressure, echo=FALSE}
+############################################################
+# Genus-level Shannon diversity analysis
+# Mean ± SE barplot + replicate jitter + WT vs phr1_2 stars
+# Metadata: Brady_* treatments, phr1phr2 genotype
+# Author: Qi
+############################################################
+
+############################
+# Load libraries
+############################
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(tibble)
+  library(readxl)
+})
+
+############################
+# Input files
+############################
+bracken_file <- "/Data/to/path"
+metadata_file <- "/Data/to/path"
+
+############################
+# Read Bracken genus table
+############################
+abund <- read_tsv(bracken_file, show_col_types = FALSE)
+
+############################
+# Read metadata
+############################
+meta_raw <- read_excel(metadata_file, sheet = "Sheet1") %>%
+  select(SampleID, Treatment, Genotype)
+
+############################
+# Recode metadata
+############################
+meta <- meta_raw %>%
+  mutate(
+    Treatment = case_when(
+      Treatment == "Brady_0uM"   ~ "0uM",
+      Treatment == "Brady_10uM"  ~ "10uM",
+      Treatment == "Brady_20uM"  ~ "20uM",
+      Treatment == "Brady_50uM"  ~ "50uM",
+      Treatment == "Brady_100uM" ~ "100uM",
+      Treatment == "Brady_200uM" ~ "200uM"
+    ),
+    Genotype = ifelse(Genotype == "phr1phr2", "phr1_2", Genotype)
+  )
+
+############################
+# Set genus names as rownames
+############################
+abund_mat <- abund %>%
+  column_to_rownames(var = colnames(abund)[1]) %>%
+  as.matrix()
+
+############################
+# Convert to relative abundance
+############################
+abund_rel <- abund_mat / colSums(abund_mat)
+
+############################
+# Shannon diversity function
+############################
+shannon <- function(p) {
+  p <- p[p > 0]
+  -sum(p * log(p))
+}
+
+############################
+# Calculate Shannon per sample
+############################
+shannon_df <- data.frame(
+  Sample  = colnames(abund_rel),
+  Shannon = apply(abund_rel, 2, shannon)
+)
+
+############################
+# Merge metadata
+############################
+shannon_df <- shannon_df %>%
+  left_join(meta, by = c("Sample" = "SampleID"))
+
+############################
+# Set factor order
+############################
+shannon_df <- shannon_df %>%
+  mutate(
+    Treatment = factor(Treatment,
+                       levels = c("0uM","10uM","20uM","50uM","100uM","200uM")),
+    Genotype = factor(Genotype,
+                      levels = c("WT","phr1_2"))
+  )
+
+############################
+# Summarize replicates
+############################
+shannon_summary <- shannon_df %>%
+  group_by(Genotype, Treatment) %>%
+  summarise(
+    Mean = mean(Shannon),
+    SD   = sd(Shannon),
+    SE   = SD / sqrt(n()),
+    .groups = "drop"
+  )
+
+############################
+# WT vs phr1_2 statistics per treatment
+############################
+stat_df <- shannon_df %>%
+  group_by(Treatment) %>%
+  summarise(
+    p.value = tryCatch(t.test(Shannon ~ Genotype)$p.value,
+                       error = function(e) NA_real_),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    signif = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE           ~ "ns"
+    )
+  )
+
+############################
+# Y positions for stars
+############################
+y_pos <- shannon_summary %>%
+  group_by(Treatment) %>%
+  summarise(y = max(Mean + SE) * 1.10, .groups = "drop")
+
+stat_df <- stat_df %>%
+  left_join(y_pos, by = "Treatment")
+
+############################
+# Genotype color palette
+############################
+genotype_cols <- c(
+  "WT"      = "#228BE6",   # blue
+  "phr1_2"  = "#BE4BDB"    # red
+)
+
+
+p_bar <- ggplot() +
+
+  # Bars (mean ± SE, no fill)
+  geom_col(
+    data = shannon_summary,
+    aes(x = Treatment, y = Mean, group = Genotype),
+    position = position_dodge(width = 0.7),
+    width = 0.6,
+    fill = "white",
+    color = "black",
+    linewidth = 0.4
+  ) +
+
+  # Error bars
+  geom_errorbar(
+    data = shannon_summary,
+    aes(x = Treatment, ymin = Mean - SE, ymax = Mean + SE, group = Genotype),
+    position = position_dodge(width = 0.7),
+    width = 0.2,
+    linewidth = 0.4
+  ) +
+
+  # Jittered replicates (colored by genotype)
+  geom_jitter(
+    data = shannon_df,
+    aes(x = Treatment, y = Shannon, color = Genotype, shape = Genotype),
+    position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.7),
+    size = 2,
+    alpha = 0.8
+  ) +
+
+  # Significance stars
+  geom_text(
+    data = stat_df,
+    aes(x = Treatment, y = y, label = signif),
+    size = 4,
+    vjust = 0
+  ) +
+
+  # Custom genotype colors (jitter + legend)
+  scale_color_manual(values = genotype_cols) +
+
+  labs(
+    x = "Pi treatment",
+    y = "Shannon diversity (Genus level)",
+    color = "Genotype",
+    shape = "Genotype"
+  ) +
+
+  theme_classic() +
+  theme(
+    axis.line = element_line(size = 0.5),
+    text = element_text(size = 10)
+  )
+
+print(p_bar)
+
+
+
+
+############################################################
+# End of script
+############################################################
+
+
+
+
+
+
+
+```
+  
+# 8 This script performs coverage normalization of host-free metagenomic reads using BBnorm in parallel on an HPC cluster, generating normalized read files for downstream metagenome assembly (MAG reconstruction).
+  
+  
+```{bash, cache=F, eval=F}
+#!/bin/bash
+#SBATCH -J normalize_samples_PE
+#SBATCH --array=1-42%14
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=60
+#SBATCH --mem=500G
+#SBATCH -t 48:00:00
+#SBATCH -p normal
+#SBATCH -o /Data/to/path/logs/norm_%A_%a.out
+#SBATCH -e /Data/to/path/logs/norm_%A_%a.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=user@email.com
+
+set -euo pipefail
+
+THREADS=${SLURM_CPUS_PER_TASK}
+INPUT_DIR="/Data/to/path"
+OUTPUT_BASE="/Data/to/path"
+SAMPLE_LIST="${OUTPUT_BASE}/sample_list.txt"
+
+# Generate sample list from R1 files
+if [ ! -f "${SAMPLE_LIST}" ]; then
+    ls "${INPUT_DIR}"/*_R1_nohost.fq.gz | sort | sed 's/_R1_nohost.fq.gz//' > "${SAMPLE_LIST}"
+fi
+
+# Get sample name for this task
+SAMPLE_NAME=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "${SAMPLE_LIST}")
+if [ -z "${SAMPLE_NAME}" ]; then
+    echo "[ERROR] No sample found for task ${SLURM_ARRAY_TASK_ID}"
+    exit 1
+fi
+
+# Define input and output files
+R1_IN="${INPUT_DIR}/${SAMPLE_NAME}_R1_nohost.fq.gz"
+R2_IN="${INPUT_DIR}/${SAMPLE_NAME}_R2_nohost.fq.gz"
+SAMPLE_OUT="${OUTPUT_BASE}/${SAMPLE_NAME}"
+mkdir -p "${SAMPLE_OUT}"
+
+R1_OUT="${SAMPLE_OUT}/${SAMPLE_NAME}_R1_norm.fq.gz"
+R2_OUT="${SAMPLE_OUT}/${SAMPLE_NAME}_R2_norm.fq.gz"
+
+# Check if both input files exist
+if [ ! -f "${R1_IN}" ] || [ ! -f "${R2_IN}" ]; then
+    echo "[ERROR] Missing input files for ${SAMPLE_NAME}"
+    echo "  R1: ${R1_IN}"
+    echo "  R2: ${R2_IN}"
+    exit 1
+fi
+
+echo "[INFO] Normalizing paired-end sample: ${SAMPLE_NAME}"
+echo "[INFO] R1: ${R1_IN}"
+echo "[INFO] R2: ${R2_IN}"
+
+# Run bbnorm for paired-end
+bbnorm.sh \
+    in1="${R1_IN}" \
+    in2="${R2_IN}" \
+    out1="${R1_OUT}" \
+    out2="${R2_OUT}" \
+    target=100 \
+    min=5 \
+    threads="${THREADS}"
+
+echo "[INFO] Done: ${SAMPLE_NAME}"
+```
+
+
+
+## 9 This script performs co-assembly of all normalized metagenomic reads using MEGAHIT, followed by assembly quality assessment with QUAST, to generate and evaluate contigs for downstream metagenome-assembled genome (MAG) reconstruction.
+
+```{bash, cache=F, eval=F}
+#!/bin/bash
+#SBATCH -J MEGAHIT_PE
+#SBATCH -p normal
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=100
+#SBATCH --mem=500G
+#SBATCH -t 72:00:00
+#SBATCH -o /Data/to/path/logs/megahit_pe_%j.out
+#SBATCH -e /Data/to/path/logs/megahit_pe_%j.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=user@email.com
+
+set -euo pipefail
+trap 'echo "[ERROR] MEGAHIT failed at $(date)" >&2' ERR
+
+# =============================
+# Logging function
+# =============================
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+# =============================
+# Paths
+# =============================
+NORM_READS="/Data/to/path"
+OUT_BASE="/Data/to/path"
+ASSEMBLY_DIR="${OUT_BASE}/assembly"
+QUAST_DIR="${OUT_BASE}/quast"
+TMP_DIR="/scratch/${USER}/megahit_tmp_$$"
+
+mkdir -p "${ASSEMBLY_DIR}" "${QUAST_DIR}" "${TMP_DIR}"
+export TMPDIR="${TMP_DIR}"
+
+# =============================
+# Collect paired-end reads
+# =============================
+log "Collecting paired-end normalized FASTQ files..."
+
+# Find R1 and R2 files separately
+R1_FILES=$(find "${NORM_READS}" -type f -name "*_R1_norm.fq.gz" | sort)
+R2_FILES=$(find "${NORM_READS}" -type f -name "*_R2_norm.fq.gz" | sort)
+
+# Alternative naming patterns (uncomment if needed):
+# R1_FILES=$(find "${NORM_READS}" -type f -name "*_1_norm.fq.gz" | sort)
+# R2_FILES=$(find "${NORM_READS}" -type f -name "*_2_norm.fq.gz" | sort)
+
+if [[ -z "${R1_FILES}" ]] || [[ -z "${R2_FILES}" ]]; then
+    log "ERROR: No paired-end normalized FASTQ files found"
+    log "Expected patterns: *_R1_norm.fq.gz and *_R2_norm.fq.gz"
+    log "Or: *_1_norm.fq.gz and *_2_norm.fq.gz"
+    exit 1
+fi
+
+# Count files
+R1_COUNT=$(echo "${R1_FILES}" | wc -l)
+R2_COUNT=$(echo "${R2_FILES}" | wc -l)
+
+log "Found ${R1_COUNT} R1 files and ${R2_COUNT} R2 files"
+
+if [[ ${R1_COUNT} -ne ${R2_COUNT} ]]; then
+    log "ERROR: Mismatched R1 (${R1_COUNT}) and R2 (${R2_COUNT}) file counts"
+    exit 1
+fi
+
+# Create comma-separated lists for MEGAHIT
+R1_LIST=$(echo "${R1_FILES}" | paste -sd ',')
+R2_LIST=$(echo "${R2_FILES}" | paste -sd ',')
+
+log "First 3 R1 files:"
+echo "${R1_FILES}" | head -3 | while read -r FILE; do
+    echo "  ${FILE}"
+done
+
+log "First 3 R2 files:"
+echo "${R2_FILES}" | head -3 | while read -r FILE; do
+    echo "  ${FILE}"
+done
+
+# =============================
+# Validate paired-end matching
+# =============================
+log "Validating paired-end file matching..."
+
+# Check if R1 and R2 files match by sample name
+MISMATCH=false
+paste <(echo "${R1_FILES}") <(echo "${R2_FILES}") | while read -r R1 R2; do
+    # Extract sample names (assuming _R1_ and _R2_ pattern)
+    SAMPLE1=$(basename "${R1}" | sed 's/_R1_norm\.fq\.gz//')
+    SAMPLE2=$(basename "${R2}" | sed 's/_R2_norm\.fq\.gz//')
+    
+    if [[ "${SAMPLE1}" != "${SAMPLE2}" ]]; then
+        log "WARNING: Mismatched sample names: ${SAMPLE1} vs ${SAMPLE2}"
+        MISMATCH=true
+    fi
+done
+
+if [[ "${MISMATCH}" == "true" ]]; then
+    log "WARNING: Some R1/R2 files may not match correctly"
+    log "Check your file naming carefully!"
+fi
+
+# =============================
+# Check if assembly already exists
+# =============================
+if [[ -f "${ASSEMBLY_DIR}/final.contigs.fa" ]] && [[ -s "${ASSEMBLY_DIR}/final.contigs.fa" ]]; then
+    log "WARNING: Assembly already exists at ${ASSEMBLY_DIR}/final.contigs.fa"
+    log "Delete it to force re-assembly"
+    # exit 0  # Uncomment to skip if exists
+fi
+
+# =============================
+# MEGAHIT co-assembly (Paired-End)
+# =============================
+log "=========================================="
+log "Starting MEGAHIT paired-end co-assembly"
+log "Samples: ${R1_COUNT} paired-end samples"
+log "R1 files: ${R1_LIST}"
+log "R2 files: ${R2_LIST}"
+log "Output: ${ASSEMBLY_DIR}"
+log "Threads: ${SLURM_CPUS_PER_TASK}"
+log "=========================================="
+
+# Build the MEGAHIT command
+MEGAHIT_CMD="megahit \
+    -1 ${R1_LIST} \
+    -2 ${R2_LIST} \
+    -o ${ASSEMBLY_DIR} \
+    --force \
+    -t ${SLURM_CPUS_PER_TASK} \
+    --min-contig-len 1000 \
+    --memory 0.9 \
+    --tmp-dir ${TMP_DIR}"
+
+# Add presets for better assembly (optional)
+# MEGAHIT_CMD="${MEGAHIT_CMD} --presets meta-sensitive"
+
+log "Running command:"
+log "${MEGAHIT_CMD}"
+
+# Execute MEGAHIT
+eval "${MEGAHIT_CMD}" 2>&1 || {
+    log "ERROR: MEGAHIT failed"
+    exit 1
+}
+
+# Check if assembly succeeded
+if [[ ! -f "${ASSEMBLY_DIR}/final.contigs.fa" ]]; then
+    log "ERROR: MEGAHIT did not produce final.contigs.fa"
+    exit 1
+fi
+
+log "MEGAHIT finished successfully"
+
+# =============================
+# Assembly statistics
+# =============================
+log "=========================================="
+log "Assembly statistics:"
+
+CONTIG_COUNT=$(grep -c "^>" "${ASSEMBLY_DIR}/final.contigs.fa" 2>/dev/null || echo "0")
+log "  Total contigs: ${CONTIG_COUNT}"
+
+# Calculate total base pairs
+TOTAL_BP=$(awk '/^>/ {if (seqlen) print seqlen; seqlen=0; next} {seqlen += length($0)} END {print seqlen}' "${ASSEMBLY_DIR}/final.contigs.fa" 2>/dev/null || echo "0")
+log "  Total base pairs: ${TOTAL_BP}"
+
+# Calculate N50
+N50=$(awk '/^>/ {if (seqlen) print seqlen; seqlen=0; next} {seqlen += length($0)} END {print seqlen}' "${ASSEMBLY_DIR}/final.contigs.fa" 2>/dev/null | sort -rn | awk 'BEGIN {sum=0} {sum+=$1; if (sum>=total/2) {print $1; exit}}' total=$(grep -v "^>" "${ASSEMBLY_DIR}/final.contigs.fa" | awk '{sum+=length($0)} END {print sum}' 2>/dev/null || echo "1") 2>/dev/null || echo "0")
+log "  N50: ${N50}"
+
+# Largest contig
+LARGEST=$(awk '/^>/ {if (seqlen) print seqlen; seqlen=0; next} {seqlen += length($0)} END {print seqlen}' "${ASSEMBLY_DIR}/final.contigs.fa" 2>/dev/null | sort -rn | head -1 || echo "0")
+log "  Largest contig: ${LARGEST}"
+
+log "=========================================="
+
+# =============================
+# QUAST QC
+# =============================
+log "Running QUAST quality assessment..."
+
+quast.py \
+    "${ASSEMBLY_DIR}/final.contigs.fa" \
+    -o "${QUAST_DIR}" \
+    -t "${SLURM_CPUS_PER_TASK}" \
+    --gene-finding \
+    --est-ref-size 1000000 \
+    --fragmented 2>&1 || {
+        log "WARNING: QUAST had errors, but assembly may still be usable"
+        log "Check ${QUAST_DIR}/report.html manually"
+    }
+
+log "QUAST completed"
+
+# =============================
+# Generate coverage report (optional)
+# =============================
+log "Generating coverage report..."
+
+# Map reads back to assembly
+BOWTIE2_INDEX="${ASSEMBLY_DIR}/assembly_index"
+bowtie2-build "${ASSEMBLY_DIR}/final.contigs.fa" "${BOWTIE2_INDEX}" 2>/dev/null || {
+    log "WARNING: bowtie2-build failed"
+}
+
+# Create coverage file if bowtie2 succeeded
+if [[ -f "${BOWTIE2_INDEX}.1.bt2" ]]; then
+    log "Mapping reads to assembly for coverage..."
+    # This would map all reads and calculate coverage
+    # For full coverage, you'd need a separate script
+fi
+
+# =============================
+# Summary
+# =============================
+log "=========================================="
+log "Paired-end assembly + QC completed at $(date)"
+log ""
+log "Output files:"
+log "  Assembly: ${ASSEMBLY_DIR}/final.contigs.fa"
+log "  Log: ${ASSEMBLY_DIR}/log"
+log "  QC report: ${QUAST_DIR}/report.html"
+log "  QC summary: ${QUAST_DIR}/report.tsv"
+log ""
+log "Assembly stats:"
+log "  Contigs: ${CONTIG_COUNT}"
+log "  Total bp: ${TOTAL_BP}"
+log "  N50: ${N50}"
+log "  Largest: ${LARGEST}"
+log "=========================================="
+
+# =============================
+# Cleanup
+# =============================
+log "Cleaning up temporary files..."
+rm -rf "${TMP_DIR}"
+log "Done"
+
+```
+
+#10 This script downloads amino acid sequences for KEGG Orthology (KO) identifiers listed in a file, fetching up to 200 genes per KO in batches via the KEGG REST API, and saves each KO’s sequences as a separate FASTA file for downstream analyses.
+
+```{bash, cache=F, eval=F}
+#!/bin/bash
+
+KO_FILE="/Data/to/path"
+OUTDIR="/Data/to/path"
+mkdir -p "$OUTDIR"
+
+KEGG="https://rest.kegg.jp"
+MAX_GENES_PER_KO=200
+BATCH_SIZE=10
+DELAY=3
+
+while IFS= read -r line; do
+    # --- CLEAN THE LINE ---
+    # Remove carriage returns (\r), leading/trailing whitespace, and comments
+    KO=$(echo "$line" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*#.*$//; s/[[:space:]]*$//')
+    [[ -z "$KO" ]] && continue
+
+    # Validate format: must be K followed by exactly 5 digits
+    if ! [[ "$KO" =~ ^K[0-9]{5}$ ]]; then
+        echo " ⚠ Skipping invalid KO: '$KO' (expected format: K00001)"
+        continue
+    fi
+
+    echo "Processing $KO ..."
+    OUTFILE="${OUTDIR}/${KO}.faa"
+
+    if [[ -s "$OUTFILE" ]]; then
+        echo "   ✓ Already downloaded, skipping"
+        continue
+    fi
+
+    # Fetch gene list
+    GENE_RESPONSE=$(curl -s --user-agent "KEGG-Download/1.0 (qi@mpipz.mpg.de)" "${KEGG}/link/genes/${KO}")
+    if [[ -z "$GENE_RESPONSE" ]] || [[ "$GENE_RESPONSE" == *"404 Not Found"* ]]; then
+        echo "   ✗ No genes found for $KO"
+        continue
+    fi
+
+    mapfile -t GENE_ARRAY < <(echo "$GENE_RESPONSE" | cut -f2 | head -n "$MAX_GENES_PER_KO")
+    TOTAL_GENES="${#GENE_ARRAY[@]}"
+
+    if [[ $TOTAL_GENES -eq 0 ]]; then
+        echo "   ✗ No valid genes for $KO"
+        continue
+    fi
+
+    echo "   Found $TOTAL_GENES genes"
+
+    > "$OUTFILE"
+    BATCH=()
+    for GENE in "${GENE_ARRAY[@]}"; do
+        BATCH+=("$GENE")
+        if [[ ${#BATCH[@]} -eq $BATCH_SIZE ]]; then
+            BATCH_STR=$(IFS='+'; echo "${BATCH[*]}")
+            curl -s --user-agent "KEGG-Download/1.0 (qi@mpipz.mpg.de)" \
+                 "${KEGG}/get/${BATCH_STR}/aaseq" >> "$OUTFILE"
+            sleep "$DELAY"
+            BATCH=()
+        fi
+    done
+
+    if [[ ${#BATCH[@]} -gt 0 ]]; then
+        BATCH_STR=$(IFS='+'; echo "${BATCH[*]}")
+        curl -s --user-agent "KEGG-Download/1.0 (qi@mpipz.mpg.de)" \
+             "${KEGG}/get/${BATCH_STR}/aaseq" >> "$OUTFILE"
+        sleep "$DELAY"
+    fi
+
+    if [[ -s "$OUTFILE" ]]; then
+        echo " ✓ Success: $KO"
+    else
+        echo " ✗ Failed: $KO (empty file)"
+        rm -f "$OUTFILE"
+    fi
+
+done < "$KO_FILE"
+
+echo "All done."
+
+```
+
+## 11 This script reduces redundancy in KO amino acid FASTA files by clustering sequences at 99% identity using CD-HIT, producing non-redundant FASTA files and logging the clustering results.
+
+```{bash, cache=F, eval=F}
+#!/bin/bash
+
+IN_DIR="KO_OA_FASTA"
+OUT_DIR="fasta_nr"
+LOG_DIR="logs"
+
+mkdir -p "$OUT_DIR" "$LOG_DIR"
+
+for FAA in ${IN_DIR}/K*.faa; do
+
+  BASENAME=$(basename "$FAA" .faa)
+  OUTFAA="${OUT_DIR}/${BASENAME}.nr.faa"
+  LOG="${LOG_DIR}/${BASENAME}.cdhit.log"
+
+  echo "Running CD-HIT on ${BASENAME}"
+
+  cd-hit \
+    -i "$FAA" \
+    -o "$OUTFAA" \
+    -c 0.99 \
+    -n 5 \
+    -M 16000 \
+    -T 8 \
+    > "$LOG"
+
+done
+
+echo "CD-HIT finished for all KOs."
+
+
+```
+
+
+
+## 12 This script creates non-redundant KO FASTA files by simply copying each original KO FASTA to a new folder, while reporting the number of sequences in each file, without performing any deduplication.
+
+```{bash, cache=F, eval=F}
+#!/bin/bash
+set -euo pipefail
+
+echo "[INFO] Job started at $(date)"
+echo "[INFO] Running on host: $(hostname)"
+
+# ============================================================
+# Paths
+# ============================================================
+SRC_DIR="/Data/to/path"
+OUT_DIR="/Data/to/path"
+
+mkdir -p "$OUT_DIR" logs
+
+# ============================================================
+# Loop over each KO FASTA
+# ============================================================
+for FAA in "$SRC_DIR"/K*.faa; do
+    KO=$(basename "$FAA" .faa)
+    NR_FASTA="${OUT_DIR}/${KO}.nr.faa"
+
+    echo "============================================"
+    echo "[INFO] Processing $KO"
+    echo "============================================"
+
+    # Copy the original sequences to .nr.faa
+    # (keep all sequences, no deduplication)
+    cp "$FAA" "$NR_FASTA"
+
+    # Count sequences
+    NSEQ=$(grep -c "^>" "$NR_FASTA")
+    echo "[INFO] $KO contains $NSEQ sequences"
+
+done
+
+echo "[INFO] All KO .nr.faa files created in $OUT_DIR"
+echo "[INFO] Job finished at $(date)"
+
+
+
+```
+
+
+
+# 13 This script builds HMM profiles for each KO by: aligning non-redundant sequences with MAFFT, trimming the alignment with trimAl, constructing the HMM using hmmbuild, and adding a KO-specific name to the HMM, while skipping KOs with too few sequences.
+
+  
+```{bash, eval=F, cache=F}
+≈#!/bin/bash
+
+# ============================================================
+# Configuration
+# ============================================================
+NR_DIR="fasta_nr"
+ALN_DIR="alignments"
+TRIM_DIR="trimmed"
+HMM_DIR="hmm"
+LOG_DIR="logs"
+
+CPU=8
+
+mkdir -p "$ALN_DIR" "$TRIM_DIR" "$HMM_DIR" "$LOG_DIR"
+
+# ============================================================
+# Loop over each KO
+# ============================================================
+for FAA in ${NR_DIR}/K*.nr.faa; do
+
+  KO=$(basename "$FAA" .nr.faa)
+
+  echo "============================================"
+  echo "Processing $KO"
+  echo "============================================"
+
+  # ----------------------------------------------------------
+  # Skip if too few sequences
+  # ----------------------------------------------------------
+  NSEQ=$(grep -c "^>" "$FAA")
+
+  if [[ $NSEQ -lt 5 ]]; then
+    echo "Skipping $KO (only $NSEQ sequences)" | tee -a "$LOG_DIR/skipped.log"
+    continue
+  fi
+
+  # ----------------------------------------------------------
+  # 1. MAFFT alignment
+  # ----------------------------------------------------------
+  ALN="${ALN_DIR}/${KO}.aln.faa"
+
+  mafft \
+    --maxiterate 1000 \
+    --localpair \
+    --thread $CPU \
+    "$FAA" > "$ALN" \
+    2> "$LOG_DIR/${KO}.mafft.log"
+
+  # ----------------------------------------------------------
+  # 2. trimAl
+  # ----------------------------------------------------------
+  TRIM="${TRIM_DIR}/${KO}.trim.faa"
+
+  trimal \
+    -in "$ALN" \
+    -out "$TRIM" \
+    -automated1 \
+    2> "$LOG_DIR/${KO}.trimal.log"
+
+  # Check trimmed alignment size
+  NTRIM=$(grep -c "^>" "$TRIM")
+
+  if [[ $NTRIM -lt 5 ]]; then
+    echo "Skipping $KO after trimming (only $NTRIM seqs)" | tee -a "$LOG_DIR/skipped.log"
+    continue
+  fi
+
+  # ----------------------------------------------------------
+  # 3. Build HMM
+  # ----------------------------------------------------------
+  HMM="${HMM_DIR}/${KO}.hmm"
+
+  hmmbuild \
+    --cpu $CPU \
+    "$HMM" \
+    "$TRIM" \
+    > "$LOG_DIR/${KO}.hmmbuild.log"
+
+  # ----------------------------------------------------------
+  # 4. Add NAME field explicitly (important)
+  # ----------------------------------------------------------
+  sed -i "s/^NAME.*/NAME  ${KO}/" "$HMM"
+
+done
+
+echo "All individual HMMs built."
+
+```
+
+# 14 This script merges individual KO HMM files into a single HMM database, checks for duplicate NAME fields, and prepares the database for HMMER searches using hmmpress.
+
+  
+```{bash, eval=F, cache=F}
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# =========================
+# Fixed paths (user-specified)
+# =========================
+HMM_DIR="/Data/to/path"
+OUT_DB="/Data/to/path"
+
+# =========================
+# Checks
+# =========================
+if [[ ! -d "$HMM_DIR" ]]; then
+    echo "ERROR: Directory not found: $HMM_DIR" >&2
+    exit 1
+fi
+
+command -v hmmpress >/dev/null 2>&1 || {
+    echo "ERROR: hmmpress not found in PATH" >&2
+    exit 1
+}
+
+shopt -s nullglob
+HMM_FILES=("$HMM_DIR"/*.hmm)
+shopt -u nullglob
+
+if [[ ${#HMM_FILES[@]} -eq 0 ]]; then
+    echo "ERROR: No .hmm files found in $HMM_DIR" >&2
+    exit 1
+fi
+
+echo "Found ${#HMM_FILES[@]} HMM files."
+
+# =========================
+# Merge HMM files
+# =========================
+echo "Merging HMM files into:"
+echo "  $OUT_DB"
+cat "${HMM_FILES[@]}" > "$OUT_DB"
+
+# =========================
+# Validate HMM NAME fields
+# =========================
+echo "Checking for duplicate HMM NAME entries..."
+dup_names=$(grep "^NAME" "$OUT_DB" | awk '{print $2}' | sort | uniq -d)
+
+if [[ -n "$dup_names" ]]; then
+    echo "WARNING: Duplicate HMM NAME fields detected:"
+    echo "$dup_names"
+else
+    echo "No duplicate HMM NAME fields found."
+fi
+
+# =========================
+# Press the HMMER database
+# =========================
+echo "Running hmmpress..."
+hmmpress "$OUT_DB"
+
+echo "Done. HMMER database files created:"
+ls -lh "$OUT_DB" "$OUT_DB".h3*
+
+
+
+```
+
+
+# 15 This script computes TPM (Transcripts Per Million) abundances for HMM-identified genes in metagenomic samples by: predicting genes with Prodigal, searching proteins against a merged HMM database with HMMER, extracting hit sequences, mapping raw reads to hit genes using Bowtie2, counting mapped reads, calculating gene lengths, and generating a gene-by-sample TPM abundance matrix.
+
+
+  
+```{bash, eval=F, cache=F}
+#!/bin/bash
+#SBATCH -J HMMER_gene_TPM
+#SBATCH -p normal
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=500G
+#SBATCH -t 72:00:00
+#SBATCH -o /Data/to/path/logs/hmmer_tpm_%j.out
+#SBATCH -e /Data/to/path/logs/hmmer_tpm_%j.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=user@email.com
+
+set -euo pipefail
+shopt -s nullglob
+
+echo "[INFO] Job started at $(date)"
+echo "[INFO] Host: $(hostname)"
+
+# =============================
+# Paths
+# =============================
+OUT_BASE="/Data/to/path"
+ASSEMBLY="/Data/to/path"
+RAW_READS="/Data/to/path"
+HMM_FILE="/Data/to/path"
+
+PRED_DIR="${OUT_BASE}/predicted"
+SEARCH_DIR="${OUT_BASE}/search"
+MAP_DIR="${OUT_BASE}/mapping"
+COUNTS_DIR="${OUT_BASE}/counts"
+ABUND_DIR="${OUT_BASE}/abundance"
+
+mkdir -p "${PRED_DIR}" "${SEARCH_DIR}" "${MAP_DIR}" \
+         "${COUNTS_DIR}" "${ABUND_DIR}"
+
+# =============================
+# Validate FASTQ files
+# =============================
+FASTQS=("${RAW_READS}"/*.fq.gz)
+if [[ ${#FASTQS[@]} -eq 0 ]]; then
+    echo "[ERROR] No FASTQ files found"
+    exit 1
+fi
+
+# =============================
+# 1. Prodigal gene prediction
+# =============================
+PROTEINS="${PRED_DIR}/proteins.faa"
+GENES="${PRED_DIR}/genes.fna"
+
+if [[ ! -f "${PROTEINS}" ]]; then
+    echo "[INFO] Running Prodigal..."
+    prodigal -i "${ASSEMBLY}" \
+             -a "${PROTEINS}" \
+             -d "${GENES}" \
+             -p meta -q
+fi
+
+# =============================
+# 2. HMMER search
+# =============================
+HITS_TBL="${SEARCH_DIR}/gene_hits.tbl"
+DOM_TBL="${SEARCH_DIR}/gene_dom.tbl"
+
+if [[ ! -f "${HITS_TBL}" ]]; then
+    echo "[INFO] Running hmmsearch..."
+    hmmsearch --cpu "${SLURM_CPUS_PER_TASK}" \
+              --tblout "${HITS_TBL}" \
+              --domtblout "${DOM_TBL}" \
+              -E 1e-10 \
+              "${HMM_FILE}" "${PROTEINS}" \
+              > "${SEARCH_DIR}/search.out"
+fi
+
+# =============================
+# 3. Extract HMM-hit genes (FIXED)
+# =============================
+HIT_IDS="${SEARCH_DIR}/hit_ids.txt"
+HIT_GENES="${SEARCH_DIR}/hit_genes.fna"
+
+if [[ ! -f "${HIT_GENES}" ]]; then
+    echo "[INFO] Extracting HMM hits..."
+
+    # Correct full-sequence E-value column (column 7)
+    awk 'NR>3 && $7 < 1e-10 {print $1}' "${HITS_TBL}" | sort -u > "${HIT_IDS}"
+
+    if [[ ! -s "${HIT_IDS}" ]]; then
+        echo "[ERROR] No HMM hits found"
+        exit 1
+    fi
+
+    seqkit grep -f "${HIT_IDS}" "${GENES}" > "${HIT_GENES}"
+fi
+
+# =============================
+# 4. Bowtie2 index
+# =============================
+HIT_INDEX="${MAP_DIR}/hit_genes"
+
+if [[ ! -f "${HIT_INDEX}.1.bt2" ]]; then
+    echo "[INFO] Building Bowtie2 index..."
+    bowtie2-build "${HIT_GENES}" "${HIT_INDEX}"
+fi
+
+# =============================
+# 5. Mapping and counting (FIXED)
+# =============================
+for FQ in "${FASTQS[@]}"; do
+    SAMPLE=$(basename "${FQ}" .fq.gz)
+    BAM="${MAP_DIR}/${SAMPLE}.bam"
+    COUNTS="${COUNTS_DIR}/${SAMPLE}_counts.tsv"
+
+    if [[ ! -f "${BAM}" ]]; then
+        echo "[INFO] Mapping ${SAMPLE}..."
+        bowtie2 -p "${SLURM_CPUS_PER_TASK}" \
+                -x "${HIT_INDEX}" \
+                -U "${FQ}" |
+            samtools sort -@ "${SLURM_CPUS_PER_TASK}" -o "${BAM}" -
+        samtools index "${BAM}"
+    fi
+
+    if [[ ! -f "${COUNTS}" ]]; then
+        echo "[INFO] Counting reads for ${SAMPLE}..."
+        samtools idxstats "${BAM}" |
+            awk '$1!="*" {print $1 "\t" $3}' > "${COUNTS}"
+    fi
+done
+
+# =============================
+# 6. Gene length calculation (FIXED)
+# =============================
+GENE_LEN_FILE="${COUNTS_DIR}/hit_gene_lengths.tsv"
+
+awk '
+    /^>/{
+        if(id){
+            print id, length(seq)
+        }
+        split($0,a," ")
+        id=substr(a[1],2)
+        seq=""
+        next
+    }
+    {seq=seq $0}
+    END{
+        if(id){
+            print id, length(seq)
+        }
+    }
+' "${HIT_GENES}" > "${GENE_LEN_FILE}"
+
+if [[ ! -s "${GENE_LEN_FILE}" ]]; then
+    echo "[ERROR] Gene length file empty"
+    exit 1
+fi
+
+# =============================
+# 7. Calculate RPK and TPM
+# =============================
+
+RPK_MATRIX="${ABUND_DIR}/gene_abundance_rpk.tsv"
+TPM_MATRIX="${ABUND_DIR}/gene_abundance_tpm.tsv"
+
+echo "[INFO] Generating the RPK matrix..."
+
+# Write the header and all gene-level RPK values.
+{
+    printf "Gene_ID"
+
+    for FQ in "${FASTQS[@]}"; do
+        SAMPLE=$(basename "${FQ}" .fq.gz)
+        printf "\t%s" "${SAMPLE}"
+    done
+
+    printf "\n"
+
+    while read -r GENE LEN; do
+        printf "%s" "${GENE}"
+
+        for FQ in "${FASTQS[@]}"; do
+            SAMPLE=$(basename "${FQ}" .fq.gz)
+            COUNTS_FILE="${COUNTS_DIR}/${SAMPLE}_counts.tsv"
+
+            COUNT=$(awk -v g="${GENE}" '
+                $1 == g {
+                    print $2
+                    found = 1
+                    exit
+                }
+                END {
+                    if (!found) print 0
+                }
+            ' "${COUNTS_FILE}")
+
+            # RPK = mapped count / gene length in kilobases.
+            awk -v count="${COUNT}" -v len="${LEN}" '
+                BEGIN {
+                    rpk = (len > 0) ? count * 1000 / len : 0
+                    printf "\t%.12g", rpk
+                }
+            '
+        done
+
+        printf "\n"
+    done < "${GENE_LEN_FILE}"
+
+} > "${RPK_MATRIX}"
+
+echo "[INFO] Calculating TPM..."
+
+# Read the actual header, then include every gene in the denominator.
+awk '
+    BEGIN {
+        FS = OFS = "\t"
+    }
+
+    NR == 1 {
+        header = $0
+        ncol = NF
+        next
+    }
+
+    {
+        n++
+        genes[n] = $1
+
+        for (i = 2; i <= ncol; i++) {
+            rpk[n, i] = $i
+            total_rpk[i] += $i
+        }
+    }
+
+    END {
+        print header
+
+        for (r = 1; r <= n; r++) {
+            printf "%s", genes[r]
+
+            for (i = 2; i <= ncol; i++) {
+                tpm = (total_rpk[i] > 0) \
+                    ? rpk[r, i] / total_rpk[i] * 1000000 \
+                    : 0
+
+                printf "\t%.6f", tpm
+            }
+
+            printf "\n"
+        }
+    }
+' "${RPK_MATRIX}" > "${TPM_MATRIX}"
+
+echo "[INFO] RPK matrix written to: ${RPK_MATRIX}"
+echo "[INFO] TPM matrix written to: ${TPM_MATRIX}"
+
+
+
+```
+
+
+
+# 16 This script annotates a gene-level TPM matrix with KEGG Orthology (KO) identifiers by mapping each gene to its KO based on HMMER hit results and producing a KO-tagged TPM matrix for downstream functional analysis.
+
+
+  
+```{bash, eval=F, cache=F}
+
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+
+TPM_MATRIX="/Data/to/path"
+GENE_HITS="/Data/to/path"
+OUT_DIR="/Data/to/path"
+
+mkdir -p "${OUT_DIR}"
+
+# 1. Gene → KO mapping (whitespace-safe)
+awk '$0!~/^#/ {print $1 "\t" $3}' "${GENE_HITS}" | sort -u > "${OUT_DIR}/gene_to_KO.tsv"
+
+# 2. Build header
+HEADER=$(head -n1 "${TPM_MATRIX}" | awk '{print "KO\t" $0}')
+
+# 3. Add KO column
+awk -v OFS="\t" -v header="$HEADER" '
+BEGIN{
+    print header
+    while((getline < "'"${OUT_DIR}/gene_to_KO.tsv"'") > 0){
+        ko[$1]=$2
+    }
+}
+NR>1{
+    g=$1
+    k=(g in ko)?ko[g]:"NA"
+    print k, $0
+}
+' "${TPM_MATRIX}" > "${OUT_DIR}/gene_abundance_tpm_with_KO.tsv"
+
+echo "[INFO] TPM matrix with KO written to: ${OUT_DIR}/gene_abundance_tpm_with_KO.tsv"
+
+
+
+```
+
+
+## 17 Plot the TPM of each gene acrross different treatment for WT and phr1phr2
+
+```{r pressure, echo=FALSE}
+
+
+suppressMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(readxl)
+  library(scales)
+})
+
+# -------------------------------
+# 1. Paths
+# -------------------------------
+abund_file <- "/Data/to/path"
+meta_file  <- "/Data/to/path"
+output_pdf <- "/Data/to/path"
+
+# -------------------------------
+# 2. Sample order
+# -------------------------------
+sample_order <- c(
+  "WT_0uM","WT_10uM","WT_20uM","WT_50uM","WT_100uM","WT_200uM",
+  "phr1_2_0uM","phr1_2_10uM","phr1_2_20uM",
+  "phr1_2_50uM","phr1_2_100uM","phr1_2_200uM"
+)
+
+WT_samples     <- grep("^WT_", sample_order, value = TRUE)
+phr1_2_samples <- grep("^phr1_2_", sample_order, value = TRUE)
+
+# -------------------------------
+# 3. Metadata
+# -------------------------------
+ko_meta <- read_xlsx(meta_file) %>%
+  distinct(KO, Gene, Nutrient)
+
+# -------------------------------
+# 4. Load abundance (NO LOG)
+# -------------------------------
+abund <- read.table(
+  abund_file,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+) %>%
+  filter(KO != "NA")
+
+ko_abund <- abund %>%
+  group_by(KO) %>%
+  summarise(across(where(is.numeric), sum, na.rm = TRUE), .groups = "drop")
+
+colnames(ko_abund) <- gsub("_nohost$", "", colnames(ko_abund))
+all_samples <- setdiff(colnames(ko_abund), "KO")
+
+# -------------------------------
+# 5. Detect replicates
+# -------------------------------
+get_reps <- function(samples) {
+  reps <- lapply(samples, function(s) {
+    cols <- grep(paste0("^", s, ".*\\d+$"), all_samples, value = TRUE)
+    if (s == "WT_10uM") cols <- cols[cols != "WT_10uM_3"]
+    cols
+  })
+  names(reps) <- samples
+  reps
+}
+
+WT_reps     <- get_reps(WT_samples)
+phr1_2_reps <- get_reps(phr1_2_samples)
+
+# -------------------------------
+# 6. Mean per treatment (linear)
+# -------------------------------
+mean_by_group <- function(rep_list) {
+  out <- ko_abund %>% select(KO)
+  for (s in names(rep_list)) {
+    out[[s]] <- if (length(rep_list[[s]]) > 0)
+      rowMeans(select(ko_abund, all_of(rep_list[[s]])), na.rm = TRUE)
+    else NA_real_
+  }
+  out
+}
+
+WT_mean     <- mean_by_group(WT_reps)
+phr1_2_mean <- mean_by_group(phr1_2_reps)
+
+# -------------------------------
+# 7. Normalize to WT_0uM (TRUE FC)
+# -------------------------------
+WT_0uM_ref <- WT_mean$WT_0uM
+names(WT_0uM_ref) <- WT_mean$KO
+
+normalize_fc <- function(df, ref) {
+  df %>%
+    mutate(across(-KO, ~ ifelse(ref > 0, . / ref, NA_real_)))
+}
+
+WT_norm     <- normalize_fc(WT_mean, WT_0uM_ref)
+phr1_2_norm <- normalize_fc(phr1_2_mean, WT_0uM_ref)
+
+# -------------------------------
+# 8. Join metadata + filter genes
+# -------------------------------
+remove_genes <- c(
+  "glpT","PiT","phoP","creC","icd","pyk","eno","gpmA","fdsB","zwf",
+  "pflD","pqqA","ldh","nifQ","sdhA","acs","ackA","maeB","glcB",
+  "sucA","sucB","fixJ","fixL","nifU","gltA","uhpT",
+  "ugpA","ugpB","ugpC","ugpE"
+)
+
+prep_df <- function(df) {
+  df %>%
+    left_join(ko_meta, by = "KO") %>%
+    filter(!is.na(Gene), !Gene %in% remove_genes)
+}
+
+WT_norm     <- prep_df(WT_norm)
+phr1_2_norm <- prep_df(phr1_2_norm)
+
+# -------------------------------
+# 9. Custom gene order
+# -------------------------------
+custom_gene_order <- c(
+  "pstB","pstA","pstC","pstS","phoU",
+  "ugpB","ugpA","ugpE","ugpC","uhpC",
+  "phoB","phoR","senX3","regX3","creB",
+  "narX","narL","narQ","narP",
+  "ntrB","ntrC","ntrY","ntrX",
+  "narB","nasA","nasB","nirA","NIT6","nasD","nasE",
+  "nifH","nifD","nifK","nifB","nifT","nifX","nifZ",
+  "narG","narH","narI","napA","napB",
+  "nirB","nirD","nrfA","nrfH",
+  "amoA","pmoB_amoB","pmoC_amoC","hao",
+  "gcd","pqqB","pqqC","pqqD","pqqE",
+  "acnA/B","mdh","fumA/B","gapA","pgk",
+  "sucD","frdA","ACO",
+  "gdhA","ppc","PCK","pta","fdhA"
+)
+
+WT_norm$Gene     <- factor(WT_norm$Gene, levels = custom_gene_order)
+phr1_2_norm$Gene <- factor(phr1_2_norm$Gene, levels = custom_gene_order)
+
+# -------------------------------
+# 10. Long format
+# -------------------------------
+to_long <- function(df, samples) {
+  df %>%
+    pivot_longer(all_of(samples), names_to = "Sample", values_to = "value") %>%
+    mutate(
+      Sample = factor(Sample, levels = sample_order),
+      Nutrient = factor(Nutrient)
+    )
+}
+
+WT_long     <- to_long(WT_norm, WT_samples)
+phr1_2_long <- to_long(phr1_2_norm, phr1_2_samples)
+
+# -------------------------------
+# 11. Plot per Nutrient
+# -------------------------------
+plot_per_nutrient <- function(nutrient) {
+
+  df_WT  <- WT_long     %>% filter(Nutrient == nutrient)
+  df_phr <- phr1_2_long %>% filter(Nutrient == nutrient)
+
+  lims <- range(c(df_WT$value, df_phr$value), na.rm = TRUE)
+  gradient_vals <- c(lims[1], 1, lims[2])
+
+  cols <- c("#00BFFF", "white", "#BF3EFF")
+
+  p1 <- ggplot(df_WT, aes(Sample, Gene, fill = value)) +
+    geom_tile(color = "white", linewidth = 0.4) +
+    scale_fill_gradientn(
+      colors = cols,
+      values = scales::rescale(gradient_vals),
+      limits = lims,
+      name = paste0("Fold change\n[", nutrient, "]")
+    ) +
+    facet_grid(Nutrient ~ ., scales = "free_y", space = "free_y") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+      axis.text.y = element_text(size = 7),
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      panel.border = element_rect(color = "black", fill = NA)
+    ) +
+    labs(title = paste("WT -", nutrient))
+
+  p2 <- ggplot(df_phr, aes(Sample, Gene, fill = value)) +
+    geom_tile(color = "white", linewidth = 0.4) +
+    scale_fill_gradientn(
+      colors = cols,
+      values = scales::rescale(gradient_vals),
+      limits = lims,
+      name = paste0("Fold change\n[", nutrient, "]")
+    ) +
+    facet_grid(Nutrient ~ ., scales = "free_y", space = "free_y") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+      axis.text.y = element_text(size = 7),
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      panel.border = element_rect(color = "black", fill = NA)
+    ) +
+    labs(title = paste("phr1_2 -", nutrient))
+
+  list(p1, p2)
+}
+
+plots <- do.call(c, lapply(unique(WT_long$Nutrient), plot_per_nutrient))
+
+# -------------------------------
+# 12. Save
+# -------------------------------
+ggsave(
+  output_pdf,
+  wrap_plots(plots, ncol = 2),
+  width = 7,
+  height = length(plots) * 2,
+  limitsize = FALSE
+)
+
+cat(
+  "[SUCCESS] Heatmaps with TRUE fold change saved:\n",
+  output_pdf, "\n"
+)
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+End of metagenome analysis.
+
+
